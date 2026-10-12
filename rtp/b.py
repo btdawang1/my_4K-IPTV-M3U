@@ -249,7 +249,7 @@ def _parse_list_rows(html: str) -> list[dict]:
             continue
 
         ip_match = re.search(
-            r"gotoIP\('([^']+)',\s*'multicast'\)",
+            r"gotoIP\('([^']+)',\s*'([^']+)'\)",
             row_html,
             flags=re.IGNORECASE | re.DOTALL,
         )
@@ -269,6 +269,7 @@ def _parse_list_rows(html: str) -> list[dict]:
         program_count_match = re.search(r"\d+", program_count_text)
         rows.append({
             "p_token": ip_match.group(1).strip(),
+            "source_type": ip_match.group(2).strip(),
             "host": values.get("host", ""),
             "program_count": int(program_count_match.group()) if program_count_match else 0,
             "program_count_raw": program_count_text,
@@ -281,20 +282,20 @@ def _parse_list_rows(html: str) -> list[dict]:
 
 
 def fetch_region_rows_by_ajax(province, limit=10, max_pages=2, session=None, start_page=1):
-    """按省份+组播类型分页抓取 IP 列表。"""
+    """按省份分页抓取全部类型 IP 列表。"""
     region_code = PROVINCE_CODES.get(province)
     if not region_code:
         print(f"[-] 未找到省份 [{province}] 的 region code，跳过。")
         return []
 
-    print(f"[*] 正在抓取组播源: {IPTV_BASE_URL}{IPTV_INDEX}?t=multicast&province={region_code}")
+    print(f"[*] 正在抓取地区全部源: {IPTV_BASE_URL}{IPTV_INDEX}?t=all&province={region_code}")
     all_rows = []
     seen_tokens = set()
     empty_page_hits = 0
 
     for page_num in range(start_page, start_page + max_pages):
         query = urlencode({
-            "t": "multicast",
+            "t": "all",
             "province": region_code,
             "limit": limit,
             "page": page_num,
@@ -344,6 +345,7 @@ def fetch_region_rows_by_ajax(province, limit=10, max_pages=2, session=None, sta
             decision = "候选" if not reasons else "跳过: " + ", ".join(reasons)
             print(
                 f"    IP: {row.get('host', '未知')} | 类型: {row_type or '未知'} | "
+                f"源类别: {row.get('source_type', '未知')} | "
                 f"节目数: {program_count}（原文: {row.get('program_count_raw', '')}） | "
                 f"状态: {status or '未知'} | 判定: {decision}"
             )
@@ -368,39 +370,48 @@ def get_region_assets(province, rows=None):
         return region_all, []
     return region_all, preferred
 
-def parse_s_token(detail_html: str) -> str | None:
-    """从 IP 详情页提取频道列表 s token。"""
+def parse_s_token(detail_html: str, default_type: str = "multicast") -> tuple[str, str] | None:
+    """从 IP 详情页提取频道列表 token 和类别。"""
     m = re.search(
-        r"href=['\"]\?s=([^&'\"]+)&t=multicast['\"]",
+        r"href=['\"]\?s=([^&'\"]+)&t=([^&'\"]+)['\"]",
         detail_html,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if m:
-        return m.group(1)
+        return m.group(1), m.group(2)
     m = re.search(r'data-s="([^"]+)"', detail_html, flags=re.IGNORECASE | re.DOTALL)
     if m:
-        return m.group(1)
-    m = re.search(r'href="[^"]*[?&]s=([^"&]+)', detail_html, flags=re.IGNORECASE | re.DOTALL)
+        return m.group(1), default_type
+    m = re.search(r'href="[^"]*[?&]s=([^"&]+)[^"]*[?&]t=([^"&]+)', detail_html, flags=re.IGNORECASE | re.DOTALL)
     if m:
-        return m.group(1)
+        return m.group(1), m.group(2)
     return None
 
 
-def fetch_detail_html(p_token: str, session: requests.Session | None = None) -> str:
-    query = urlencode({"p": p_token, "t": "multicast"})
+def fetch_detail_html(
+    p_token: str,
+    session: requests.Session | None = None,
+    source_type: str = "multicast",
+) -> str:
+    query = urlencode({"p": p_token, "t": source_type})
     path = f"{IPTV_INDEX}?{query}"
     data = signed_get(path, session=session)
     return data.get("html", "") or ""
 
 
-def fetch_channel_lines_by_s(s_token: str, session: requests.Session | None = None, max_pages: int = 50) -> list[str]:
+def fetch_channel_lines_by_s(
+    s_token: str,
+    session: requests.Session | None = None,
+    max_pages: int = 50,
+    source_type: str = "multicast",
+) -> list[str]:
     """分页抓取完整频道列表。"""
     all_lines: list[str] = []
     seen: set[str] = set()
     empty_hits = 0
 
     for page_num in range(1, max_pages + 1):
-        query = urlencode({"s": s_token, "t": "multicast", "page": page_num})
+        query = urlencode({"s": s_token, "t": source_type, "page": page_num})
         path = f"{IPTV_INDEX}?{query}"
         try:
             data = signed_get(path, session=session)
@@ -586,19 +597,27 @@ def fetch_channel_lines_by_province(
                 f"[*] [{province}] 候选 IP {host}，节目数 {picked.get('program_count', 0)}，抓取详情。"
             )
             try:
-                detail_html = fetch_detail_html(picked.get("p_token", ""), session=session)
+                source_type = picked.get("source_type", "multicast")
+                detail_html = fetch_detail_html(
+                    picked.get("p_token", ""), session=session, source_type=source_type
+                )
             except SiteRateLimitError as e:
                 print(f"[-] [{province}] 触发源站限流，停止后续详情抓取：{e}")
                 return group_to_sources, "rate_limited", province
             except Exception as e:
                 print(f"[-] [{province}] IP 详情获取失败: {e}")
                 continue
-            s_token = parse_s_token(detail_html) if detail_html else None
-            if not s_token:
+            channel_target = (
+                parse_s_token(detail_html, default_type=source_type) if detail_html else None
+            )
+            if not channel_target:
                 print(f"[-] [{province}] 未找到频道列表 token: {host}")
                 continue
 
-            lines = fetch_channel_lines_by_s(s_token, session=session)
+            s_token, channel_type = channel_target
+            lines = fetch_channel_lines_by_s(
+                s_token, session=session, source_type=channel_type
+            )
             print(
                 f"[*] [{province}] {host}：列表节目数 {picked.get('program_count', 0)}，"
                 f"实际解析高清频道 {len(lines)} 条。"

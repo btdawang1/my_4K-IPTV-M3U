@@ -244,7 +244,7 @@ def _parse_list_rows(html: str) -> list[dict]:
     return rows
 
 
-def fetch_region_rows_by_ajax(province, limit=20, max_pages=30, session=None):
+def fetch_region_rows_by_ajax(province, limit=10, max_pages=2, session=None):
     """按省份+组播类型分页抓取 IP 列表。"""
     region_code = PROVINCE_CODES.get(province)
     if not region_code:
@@ -463,7 +463,7 @@ def fetch_channel_lines_by_province(
     max_age_hours: int = 24,
 ):
     session = requests.Session()
-    rows = fetch_region_rows_by_ajax(province, limit=20, max_pages=max_pages, session=session)
+    rows = fetch_region_rows_by_ajax(province, limit=10, max_pages=max_pages, session=session)
     if time.time() < SITE_RATE_LIMITED_UNTIL:
         return [], "rate_limited", province
     if not rows:
@@ -726,7 +726,7 @@ def process_province(
     province,
     txt_output_dir,
     m3u_output_dir,
-    max_pages=30,
+    max_pages=2,
     max_per_carrier=5,
     max_age_hours=72,
 ):
@@ -850,8 +850,8 @@ def parse_args():
     ap.add_argument(
         "--max-pages",
         type=int,
-        default=30,
-        help="每个省份最多抓取分页数量（默认30）。",
+        default=2,
+        help="每个省份最多抓取分页数量（默认2，每页10条）。",
     )
     ap.add_argument(
         "--max-per-carrier",

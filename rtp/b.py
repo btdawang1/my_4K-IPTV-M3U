@@ -9,6 +9,7 @@ import hashlib
 import random
 import string
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 from urllib.parse import quote, urlencode
 try:
@@ -113,17 +114,46 @@ def generate_paer_token() -> str:
     return f"{ts}|{rand}|{sig}"
 
 
-REQUEST_DELAY_SEC = 0.8
-REQUEST_MAX_RETRIES = 5
+REQUEST_DELAY_SEC = 5.0
+REQUEST_MAX_RETRIES = 2
+RATE_LIMIT_BACKOFF_SEC = 60
+RATE_LIMIT_MAX_BACKOFF_SEC = 180
+RATE_LIMIT_COOLDOWN_SEC = 600
+SITE_RATE_LIMITED_UNTIL = 0.0
+
+
+class SiteRateLimitError(requests.RequestException):
+    """Raised when the source keeps returning HTTP 429 after backoff retries."""
+
+
+def _retry_after_seconds(response) -> float | None:
+    value = response.headers.get("Retry-After", "").strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
 
 
 def signed_get(path_query: str, session: requests.Session | None = None) -> dict:
     """带签名的 GET 请求，返回 JSON（含 html 字段）。"""
+    global SITE_RATE_LIMITED_UNTIL
+    if time.time() < SITE_RATE_LIMITED_UNTIL:
+        remaining = int(SITE_RATE_LIMITED_UNTIL - time.time())
+        raise SiteRateLimitError(f"源站仍在冷却中，约 {remaining} 秒后再试。")
+
     url = IPTV_BASE_URL + path_query.lstrip("/")
     sess = session or requests.Session()
     last_error = None
 
-    for attempt in range(REQUEST_MAX_RETRIES):
+    for attempt in range(REQUEST_MAX_RETRIES + 1):
         headers = {
             "User-Agent": USER_AGENT,
             "X-Requested-With": "XMLHttpRequest",
@@ -132,8 +162,18 @@ def signed_get(path_query: str, session: requests.Session | None = None) -> dict
         try:
             resp = sess.get(url, headers=headers, timeout=30)
             if resp.status_code == 429:
-                wait = min(30, REQUEST_DELAY_SEC * (2 ** attempt) * 3)
-                print(f"[!] 请求过于频繁，{wait:.1f}s 后重试 ({attempt + 1}/{REQUEST_MAX_RETRIES})...")
+                retry_after = _retry_after_seconds(resp)
+                wait = retry_after if retry_after is not None else min(
+                    RATE_LIMIT_MAX_BACKOFF_SEC,
+                    RATE_LIMIT_BACKOFF_SEC * (2 ** attempt),
+                )
+                if attempt >= REQUEST_MAX_RETRIES:
+                    cooldown = max(RATE_LIMIT_COOLDOWN_SEC, wait)
+                    SITE_RATE_LIMITED_UNTIL = time.time() + cooldown
+                    raise SiteRateLimitError(
+                        f"源站连续限流，暂停本轮后续抓取 {int(cooldown)} 秒。"
+                    )
+                print(f"[!] 源站返回 429，等待 {wait:.0f}s 后重试 ({attempt + 1}/{REQUEST_MAX_RETRIES})...")
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
@@ -141,15 +181,17 @@ def signed_get(path_query: str, session: requests.Session | None = None) -> dict
             return resp.json()
         except requests.HTTPError as e:
             last_error = e
-            if e.response is not None and e.response.status_code in (429, 503):
-                wait = min(30, REQUEST_DELAY_SEC * (2 ** attempt) * 3)
-                print(f"[!] HTTP {e.response.status_code}，{wait:.1f}s 后重试 ({attempt + 1}/{REQUEST_MAX_RETRIES})...")
+            if e.response is not None and e.response.status_code == 503:
+                wait = min(60, REQUEST_DELAY_SEC * (2 ** attempt))
+                if attempt >= REQUEST_MAX_RETRIES:
+                    raise
+                print(f"[!] HTTP 503，等待 {wait:.1f}s 后重试 ({attempt + 1}/{REQUEST_MAX_RETRIES})...")
                 time.sleep(wait)
                 continue
             raise
         except requests.RequestException as e:
             last_error = e
-            if attempt + 1 >= REQUEST_MAX_RETRIES:
+            if attempt >= REQUEST_MAX_RETRIES:
                 raise
             wait = REQUEST_DELAY_SEC * (2 ** attempt)
             print(f"[!] 网络异常，{wait:.1f}s 后重试 ({attempt + 1}/{REQUEST_MAX_RETRIES}): {e}")
@@ -207,6 +249,9 @@ def fetch_region_rows_by_ajax(province, limit=20, max_pages=30, session=None):
         path = f"{IPTV_INDEX}?{query}"
         try:
             data = signed_get(path, session=session)
+        except SiteRateLimitError as e:
+            print(f"[-] 源站限流，停止继续请求并保留已抓取的服务器：{e}")
+            break
         except Exception as e:
             print(f"[-] 请求省份 [{province}] 第{page_num}页失败: {e}")
             break
@@ -383,6 +428,8 @@ def fetch_channel_lines_by_province(
 ):
     session = requests.Session()
     rows = fetch_region_rows_by_ajax(province, limit=20, max_pages=max_pages, session=session)
+    if time.time() < SITE_RATE_LIMITED_UNTIL:
+        return [], "rate_limited", province
     if not rows:
         return [], "list_empty", province
 
@@ -464,6 +511,9 @@ def fetch_channel_lines_by_province(
         selected_ops.append(group_title)
         try:
             detail_html = fetch_detail_html(picked.get("p_token", ""), session=session)
+        except SiteRateLimitError as e:
+            print(f"[-] [{province}] 触发源站限流，停止后续详情抓取：{e}")
+            break
         except Exception as e:
             print(f"[-] [{province}] IP 详情获取失败: {e}")
             continue

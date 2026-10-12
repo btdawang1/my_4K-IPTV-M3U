@@ -422,24 +422,20 @@ def fetch_channel_lines_by_s(
             break
         html = data.get("html", "")
         source_lines = parse_channel_lines(html)
-        page_lines = [
-            line for line in source_lines
-            if is_hd_channel_name(line.split(",", 1)[0])
-        ]
         if not source_lines:
             empty_hits += 1
             if empty_hits >= 2:
                 break
             continue
         empty_hits = 0
-        for line in page_lines:
+        for line in source_lines:
             if line in seen:
                 continue
             seen.add(line)
             all_lines.append(line)
         print(
-            f"[*] 频道列表第{page_num}页共 {len(source_lines)} 条，"
-            f"符合高清条件 {len(page_lines)} 条，累计高清频道 {len(all_lines)} 条。"
+            f"[*] 频道列表第{page_num}页解析 {len(source_lines)} 条，"
+            f"累计去重频道 {len(all_lines)} 条。"
         )
         if "下一页" not in html and page_num > 1:
             break
@@ -460,17 +456,6 @@ def parse_channel_lines(channels_html: str) -> list[str]:
             continue
         lines.append(f"{name},{play_url}")
     return lines
-
-
-def is_hd_channel_name(name: str) -> bool:
-    """Keep channels explicitly labeled HD, UHD, 4K, 1080p, 720p, or 高清."""
-    return bool(
-        re.search(
-            r"高清|(?<![A-Z0-9])(?:UHD|FHD|HD|4K|1080[PI]?|720[PI]?)(?![A-Z0-9])",
-            name or "",
-            flags=re.IGNORECASE,
-        )
-    )
 
 
 def normalize_group_title(raw_type: str, province: str) -> str:
@@ -611,7 +596,7 @@ def fetch_channel_lines_by_province(
             continue
 
         saw_candidate = True
-        print(f"[*] [{province}] 本批次找到 {len(candidates)} 条存活联通候选，抓取并合并高清频道。")
+        print(f"[*] [{province}] 本批次找到 {len(candidates)} 条存活联通候选，抓取并合并频道。")
         for picked in candidates:
             scanned_source_tokens.add(picked.get("p_token", ""))
             group_title = normalize_group_title(picked.get("type", ""), province)
@@ -643,7 +628,7 @@ def fetch_channel_lines_by_province(
             )
             print(
                 f"[*] [{province}] {host}：列表节目数 {picked.get('program_count', 0)}，"
-                f"实际解析高清频道 {len(lines)} 条。"
+                f"实际解析频道 {len(lines)} 条。"
             )
             if lines:
                 selected_ops.append(group_title)
@@ -689,7 +674,7 @@ def fetch_channel_lines_by_province(
         return [], status, province
 
     print(
-        f"[*] [{province}] 扫描结束，共收集 {sum(len(sources[0]) for sources in group_to_sources.values())} 个去重高清频道，"
+        f"[*] [{province}] 扫描结束，共收集 {sum(len(sources[0]) for sources in group_to_sources.values())} 个去重频道，"
         f"来源: {', '.join(sorted(set(selected_ops)))}"
     )
     return group_to_sources, "ok", province
@@ -887,7 +872,7 @@ def process_province(
     if exported_sources == 0:
         print(f"[-] [{province}] 频道提取失败: channel_lines_empty")
         return
-    print(f"[+] [{province}] 更新完成，导出 {total_channels} 个去重高清频道，生成 {exported_sources} 个合并播放列表。")
+    print(f"[+] [{province}] 更新完成，导出 {total_channels} 个去重频道，生成 {exported_sources} 个合并播放列表。")
 
 def push_to_github(files):
     """

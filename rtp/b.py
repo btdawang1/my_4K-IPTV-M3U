@@ -230,9 +230,12 @@ def _parse_list_rows(html: str) -> list[dict]:
         tds = re.findall(r"<td[^>]*>(.*?)</td>", row_html, flags=re.IGNORECASE | re.DOTALL)
         if len(tds) < 6:
             continue
+        program_count_text = _strip_html(tds[1])
+        program_count_match = re.search(r"\d+", program_count_text)
         rows.append({
             "p_token": ip_match.group(1).strip(),
             "host": _strip_html(tds[0]),
+            "program_count": int(program_count_match.group()) if program_count_match else 0,
             "type": _strip_html(tds[2]),
             "online_time": _strip_html(tds[3]),
             "update_time": _strip_html(tds[4]),
@@ -451,7 +454,7 @@ def fetch_channel_lines_by_province(
     now_dt = datetime.now()
 
     def _is_usable_status(status: str) -> bool:
-        return ("新上线" in status) or ("存活" in status)
+        return "存活" in status
 
     def _is_recent_update(row: dict) -> bool:
         dt = _parse_site_datetime(row.get("update_time", ""))
@@ -463,16 +466,13 @@ def fetch_channel_lines_by_province(
         age_hours = (now_dt - dt).total_seconds() / 3600
         return age_hours <= max_age_hours
 
-    def _status_rank(status: str) -> int:
-        # 新上线优先于存活
-        return 2 if "新上线" in status else 1
-
     def _pick_many(rows_pool, carrier: str, limit: int):
         carrier_rows = [
             r
             for r in rows_pool
             if carrier in r.get("type", "")
             and _is_usable_status(r.get("status", ""))
+            and r.get("program_count", 0) > 0
             and _is_recent_update(r)
         ]
         if not carrier_rows or limit <= 0:
@@ -481,7 +481,9 @@ def fetch_channel_lines_by_province(
         def _sort_key(row: dict):
             dt = _parse_site_datetime(row.get("update_time", "")) or _parse_site_datetime(row.get("online_time", ""))
             ts = dt.timestamp() if dt else 0.0
-            return (_status_rank(row.get("status", "")), ts)
+            row_type = row.get("type", "")
+            nanjing_multicast_rank = 1 if "南京" in row_type and "组播" in row_type else 0
+            return (nanjing_multicast_rank, row.get("program_count", 0), ts)
 
         carrier_rows = sorted(carrier_rows, key=_sort_key, reverse=True)
         picked = []
@@ -507,7 +509,7 @@ def fetch_channel_lines_by_province(
             selected_tokens.add(token)
 
     if not selected_rows:
-        return [], "no_recent_unicom_source", province
+        return [], "no_alive_unicom_source_with_programs", province
 
     # group_title -> list of sources, each source is list of "name,url" lines
     group_to_sources: dict[str, list[list[str]]] = {}
@@ -518,7 +520,10 @@ def fetch_channel_lines_by_province(
         picked_type = picked.get("type", "")
         group_title = normalize_group_title(picked_type, province)
         selected_ops.append(group_title)
-        print(f"[*] [{province}] 联通源 {index}/{len(selected_rows)}：{picked.get('host', '未知服务器')}，抓取详情。")
+        print(
+            f"[*] [{province}] 联通源 {index}/{len(selected_rows)}："
+            f"{picked.get('host', '未知服务器')}，节目数 {picked.get('program_count', 0)}，抓取详情。"
+        )
         try:
             detail_html = fetch_detail_html(picked.get("p_token", ""), session=session)
         except SiteRateLimitError as e:
@@ -536,6 +541,10 @@ def fetch_channel_lines_by_province(
             continue
 
         lines = fetch_channel_lines_by_s(s_token, session=session)
+        print(
+            f"[*] [{province}] {picked.get('host', '未知服务器')}："
+            f"列表节目数 {picked.get('program_count', 0)}，实际解析频道 {len(lines)} 条。"
+        )
         if not lines:
             continue
         group_to_sources.setdefault(group_title, []).append(lines)

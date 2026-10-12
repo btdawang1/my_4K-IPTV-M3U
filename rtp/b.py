@@ -217,9 +217,37 @@ def signed_get(path_query: str, session: requests.Session | None = None) -> dict
 
 
 def _parse_list_rows(html: str) -> list[dict]:
-    """从 IP 列表页 HTML 解析组播行。"""
+    """按列表页表头映射字段，避免页面列顺序变化时误读数据。"""
     rows = []
-    for row_html in re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE | re.DOTALL):
+    table_rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.IGNORECASE | re.DOTALL)
+    header_indexes = None
+
+    for row_html in table_rows:
+        header_cells = re.findall(r"<th[^>]*>(.*?)</th>", row_html, flags=re.IGNORECASE | re.DOTALL)
+        if header_cells:
+            headers = [_strip_html(cell).replace(" ", "") for cell in header_cells]
+            header_indexes = {}
+            for key, aliases in {
+                "host": ("IP", "IP地址", "服务器IP"),
+                "program_count": ("节目数", "节目数量"),
+                "type": ("类型", "区域", "地区"),
+                "online_time": ("上线时间", "上线日期"),
+                "update_time": ("更新时间", "更新日期"),
+                "status": ("状态", "在线状态"),
+            }.items():
+                match = next(
+                    (index for index, header in enumerate(headers)
+                     if any(alias.lower() in header.lower() for alias in aliases)),
+                    None,
+                )
+                if match is not None:
+                    header_indexes[key] = match
+            required = {"host", "program_count", "type", "status"}
+            if not required.issubset(header_indexes):
+                print(f"[-] 列表表头无法识别，缺少字段: {', '.join(sorted(required - header_indexes.keys()))}")
+                header_indexes = None
+            continue
+
         ip_match = re.search(
             r"gotoIP\('([^']+)',\s*'multicast'\)",
             row_html,
@@ -228,18 +256,26 @@ def _parse_list_rows(html: str) -> list[dict]:
         if not ip_match:
             continue
         tds = re.findall(r"<td[^>]*>(.*?)</td>", row_html, flags=re.IGNORECASE | re.DOTALL)
-        if len(tds) < 6:
+        if not header_indexes:
+            print("[-] 跳过 IP 列表行：未识别到有效表头，避免把列错当成 IP/节目数/状态。")
             continue
-        program_count_text = _strip_html(tds[1])
+
+        if any(index >= len(tds) for index in header_indexes.values()):
+            print(f"[-] 跳过 IP 列表行：数据列数 {len(tds)} 与识别到的表头不匹配。")
+            continue
+
+        values = {key: _strip_html(tds[index]) for key, index in header_indexes.items()}
+        program_count_text = values.get("program_count", "")
         program_count_match = re.search(r"\d+", program_count_text)
         rows.append({
             "p_token": ip_match.group(1).strip(),
-            "host": _strip_html(tds[0]),
+            "host": values.get("host", ""),
             "program_count": int(program_count_match.group()) if program_count_match else 0,
-            "type": _strip_html(tds[2]),
-            "online_time": _strip_html(tds[3]),
-            "update_time": _strip_html(tds[4]),
-            "status": _strip_html(tds[5]),
+            "program_count_raw": program_count_text,
+            "type": values.get("type", ""),
+            "online_time": values.get("online_time", ""),
+            "update_time": values.get("update_time", ""),
+            "status": values.get("status", ""),
         })
     return rows
 
@@ -295,9 +331,21 @@ def fetch_region_rows_by_ajax(province, limit=10, max_pages=2, session=None, sta
             added += 1
         print(f"[*] [{province}] 第{page_num}页 {len(rows)} 条，新增 {added} 条。")
         for row in rows:
+            row_type = row.get("type", "")
+            status = row.get("status", "")
+            program_count = row.get("program_count", 0)
+            reasons = []
+            if "联通" not in row_type:
+                reasons.append("非联通")
+            if "存活" not in status:
+                reasons.append("状态未标记存活")
+            if program_count <= 0:
+                reasons.append("节目数为0")
+            decision = "候选" if not reasons else "跳过: " + ", ".join(reasons)
             print(
-                f"    IP: {row.get('host', '未知')} | 类型: {row.get('type', '未知')} | "
-                f"节目数: {row.get('program_count', 0)} | 状态: {row.get('status', '未知')}"
+                f"    IP: {row.get('host', '未知')} | 类型: {row_type or '未知'} | "
+                f"节目数: {program_count}（原文: {row.get('program_count_raw', '')}） | "
+                f"状态: {status or '未知'} | 判定: {decision}"
             )
 
     print(f"[*] [{province}] 本批次合计 {len(all_rows)} 条服务器。")

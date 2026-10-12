@@ -357,8 +357,12 @@ def fetch_channel_lines_by_s(s_token: str, session: requests.Session | None = No
         if data.get("status") != "success":
             break
         html = data.get("html", "")
-        page_lines = parse_channel_lines(html)
-        if not page_lines:
+        source_lines = parse_channel_lines(html)
+        page_lines = [
+            line for line in source_lines
+            if is_hd_channel_name(line.split(",", 1)[0])
+        ]
+        if not source_lines:
             empty_hits += 1
             if empty_hits >= 2:
                 break
@@ -369,7 +373,10 @@ def fetch_channel_lines_by_s(s_token: str, session: requests.Session | None = No
                 continue
             seen.add(line)
             all_lines.append(line)
-        print(f"[*] 频道列表第{page_num}页 {len(page_lines)} 条，累计 {len(all_lines)} 条。")
+        print(
+            f"[*] 频道列表第{page_num}页共 {len(source_lines)} 条，"
+            f"符合高清条件 {len(page_lines)} 条，累计高清频道 {len(all_lines)} 条。"
+        )
         if "下一页" not in html and page_num > 1:
             break
     return all_lines
@@ -389,6 +396,17 @@ def parse_channel_lines(channels_html: str) -> list[str]:
             continue
         lines.append(f"{name},{play_url}")
     return lines
+
+
+def is_hd_channel_name(name: str) -> bool:
+    """Keep channels explicitly labeled HD, UHD, 4K, 1080p, 720p, or 高清."""
+    return bool(
+        re.search(
+            r"高清|(?<![A-Z0-9])(?:UHD|FHD|HD|4K|1080[PI]?|720[PI]?)(?![A-Z0-9])",
+            name or "",
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def normalize_group_title(raw_type: str, province: str) -> str:

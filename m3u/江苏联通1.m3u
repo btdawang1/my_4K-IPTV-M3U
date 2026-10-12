@@ -1,0 +1,3 @@
+#EXTM3U x-tvg-url="http://epg.51zmt.top:8000/e.xml.gz"
+#EXTINF:-1 tvg-id="熊猫频道01高清" tvg-logo="https://gcore.jsdelivr.net/gh/taksssss/tv/icon/%E7%86%8A%E7%8C%AB%E9%A2%91%E9%81%9301%E9%AB%98%E6%B8%85.png" group-title="江苏联通",熊猫频道01高清
+http://116.147.109.2:1234/609158151

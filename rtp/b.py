@@ -244,7 +244,7 @@ def _parse_list_rows(html: str) -> list[dict]:
     return rows
 
 
-def fetch_region_rows_by_ajax(province, limit=10, max_pages=2, session=None):
+def fetch_region_rows_by_ajax(province, limit=10, max_pages=2, session=None, start_page=1):
     """按省份+组播类型分页抓取 IP 列表。"""
     region_code = PROVINCE_CODES.get(province)
     if not region_code:
@@ -256,7 +256,7 @@ def fetch_region_rows_by_ajax(province, limit=10, max_pages=2, session=None):
     seen_tokens = set()
     empty_page_hits = 0
 
-    for page_num in range(1, max_pages + 1):
+    for page_num in range(start_page, start_page + max_pages):
         query = urlencode({
             "t": "multicast",
             "province": region_code,
@@ -294,8 +294,13 @@ def fetch_region_rows_by_ajax(province, limit=10, max_pages=2, session=None):
             all_rows.append(row)
             added += 1
         print(f"[*] [{province}] 第{page_num}页 {len(rows)} 条，新增 {added} 条。")
+        for row in rows:
+            print(
+                f"    IP: {row.get('host', '未知')} | 类型: {row.get('type', '未知')} | "
+                f"节目数: {row.get('program_count', 0)} | 状态: {row.get('status', '未知')}"
+            )
 
-    print(f"[*] [{province}] 全分页合计 {len(all_rows)} 条服务器。")
+    print(f"[*] [{province}] 本批次合计 {len(all_rows)} 条服务器。")
     return all_rows
 
 
@@ -459,39 +464,19 @@ def parse_operator_name(detail_html: str, province: str) -> str:
 def fetch_channel_lines_by_province(
     province: str,
     max_per_carrier: int = 5,
-    max_pages: int = 30,
-    max_age_hours: int = 24,
+    max_pages: int = 0,
 ):
     session = requests.Session()
-    rows = fetch_region_rows_by_ajax(province, limit=10, max_pages=max_pages, session=session)
-    if time.time() < SITE_RATE_LIMITED_UNTIL:
-        return [], "rate_limited", province
-    if not rows:
-        return [], "list_empty", province
-
-    now_dt = datetime.now()
-
-    def _is_usable_status(status: str) -> bool:
-        return "存活" in status
-
-    def _is_recent_update(row: dict) -> bool:
-        dt = _parse_site_datetime(row.get("update_time", ""))
-        if not dt:
-            # 更新时间缺失时降级看上线时间；都缺失则判定为不新鲜
-            dt = _parse_site_datetime(row.get("online_time", ""))
-        if not dt:
-            return False
-        age_hours = (now_dt - dt).total_seconds() / 3600
-        return age_hours <= max_age_hours
+    if max_pages < 0:
+        raise ValueError("max_pages 必须大于等于0（0表示持续扫描，直到列表结束）")
 
     def _pick_many(rows_pool, carrier: str, limit: int):
         carrier_rows = [
             r
             for r in rows_pool
             if carrier in r.get("type", "")
-            and _is_usable_status(r.get("status", ""))
+            and "存活" in r.get("status", "")
             and r.get("program_count", 0) > 0
-            and _is_recent_update(r)
         ]
         if not carrier_rows or limit <= 0:
             return []
@@ -516,64 +501,77 @@ def fetch_channel_lines_by_province(
                 break
         return picked
 
-    selected_rows = []
-    selected_tokens = set()
-    for carrier in ("联通",):
-        for row in _pick_many(rows, carrier, max_per_carrier):
-            token = row.get("p_token")
-            if not token or token in selected_tokens:
-                continue
-            selected_rows.append(row)
-            selected_tokens.add(token)
-
-    if not selected_rows:
-        return [], "no_alive_unicom_source_with_programs", province
-
-    # group_title -> list of sources, each source is list of "name,url" lines
     group_to_sources: dict[str, list[list[str]]] = {}
     selected_ops: list[str] = []
+    page_start = 1
+    batch_size = 2
+    scanned_pages = 0
+    saw_list_page = False
+    saw_candidate = False
 
-    print(f"[*] [{province}] 已选中 {len(selected_rows)} 条联通源，开始抓取详情和频道。")
-    for index, picked in enumerate(selected_rows, start=1):
-        picked_type = picked.get("type", "")
-        group_title = normalize_group_title(picked_type, province)
-        selected_ops.append(group_title)
-        print(
-            f"[*] [{province}] 联通源 {index}/{len(selected_rows)}："
-            f"{picked.get('host', '未知服务器')}，节目数 {picked.get('program_count', 0)}，抓取详情。"
+    while max_pages == 0 or scanned_pages < max_pages:
+        pages_this_batch = batch_size if max_pages == 0 else min(batch_size, max_pages - scanned_pages)
+        rows = fetch_region_rows_by_ajax(
+            province, limit=10, max_pages=pages_this_batch, session=session, start_page=page_start
         )
-        try:
-            detail_html = fetch_detail_html(picked.get("p_token", ""), session=session)
-        except SiteRateLimitError as e:
-            print(f"[-] [{province}] 触发源站限流，停止后续详情抓取：{e}")
+        if time.time() < SITE_RATE_LIMITED_UNTIL:
+            return group_to_sources, "rate_limited", province
+        if not rows:
+            if not saw_list_page:
+                return [], "list_empty", province
             break
-        except Exception as e:
-            print(f"[-] [{province}] IP 详情获取失败: {e}")
-            continue
-        if not detail_html:
+        saw_list_page = True
+        scanned_pages += pages_this_batch
+        page_start += pages_this_batch
+
+        candidates = _pick_many(rows, "联通", max_per_carrier)
+        if not candidates:
+            print(f"[*] [{province}] 本批次没有节目数大于0的存活联通源，继续检查后两页。")
             continue
 
-        s_token = parse_s_token(detail_html)
-        if not s_token:
-            print(f"[-] [{province}] 未找到频道列表 token: {picked.get('host', '')}")
-            continue
+        saw_candidate = True
+        print(f"[*] [{province}] 本批次找到 {len(candidates)} 条存活联通候选，抓取详情和高清频道。")
+        for picked in candidates:
+            group_title = normalize_group_title(picked.get("type", ""), province)
+            host = picked.get("host", "未知服务器")
+            print(
+                f"[*] [{province}] 候选 IP {host}，节目数 {picked.get('program_count', 0)}，抓取详情。"
+            )
+            try:
+                detail_html = fetch_detail_html(picked.get("p_token", ""), session=session)
+            except SiteRateLimitError as e:
+                print(f"[-] [{province}] 触发源站限流，停止后续详情抓取：{e}")
+                return group_to_sources, "rate_limited", province
+            except Exception as e:
+                print(f"[-] [{province}] IP 详情获取失败: {e}")
+                continue
+            s_token = parse_s_token(detail_html) if detail_html else None
+            if not s_token:
+                print(f"[-] [{province}] 未找到频道列表 token: {host}")
+                continue
 
-        lines = fetch_channel_lines_by_s(s_token, session=session)
-        print(
-            f"[*] [{province}] {picked.get('host', '未知服务器')}："
-            f"列表节目数 {picked.get('program_count', 0)}，实际解析频道 {len(lines)} 条。"
-        )
-        if not lines:
-            continue
-        group_to_sources.setdefault(group_title, []).append(lines)
+            lines = fetch_channel_lines_by_s(s_token, session=session)
+            print(
+                f"[*] [{province}] {host}：列表节目数 {picked.get('program_count', 0)}，"
+                f"实际解析高清频道 {len(lines)} 条。"
+            )
+            if lines:
+                group_to_sources.setdefault(group_title, []).append(lines)
+                selected_ops.append(group_title)
+
+        # 已找到可导出的频道源，就不再请求更后面的分页。
+        if group_to_sources:
+            break
+        print(f"[*] [{province}] 本批次候选没有可用高清频道，继续检查后两页。")
 
     if not group_to_sources:
-        return [], "channel_lines_empty", province
+        status = "channel_lines_empty" if saw_candidate else "no_alive_unicom_source_with_programs"
+        print(f"[-] [{province}] 扫描结束，共检查 {scanned_pages} 页，仍未找到可用源。")
+        return [], status, province
 
-    unique_ops = sorted(set(selected_ops))
     print(
-        f"[*] [{province}] 已提取源数量: {len(selected_rows)}"
-        f"（联通最多{max_per_carrier}条，更新时间<= {max_age_hours}小时），来源: {', '.join(unique_ops)}"
+        f"[*] [{province}] 已提取源数量: {sum(map(len, group_to_sources.values()))}"
+        f"（每批2页，联通最多{max_per_carrier}条），来源: {', '.join(sorted(set(selected_ops)))}"
     )
     return group_to_sources, "ok", province
 
@@ -726,9 +724,8 @@ def process_province(
     province,
     txt_output_dir,
     m3u_output_dir,
-    max_pages=2,
+    max_pages=0,
     max_per_carrier=5,
-    max_age_hours=72,
 ):
     """单一省份核心流水线"""
     group_title = province
@@ -743,7 +740,6 @@ def process_province(
         province,
         max_pages=max_pages,
         max_per_carrier=max_per_carrier,
-        max_age_hours=max_age_hours,
     )
     clear_province_output_files(province, txt_output_dir, m3u_output_dir)
     if not grouped_sources:
@@ -850,20 +846,14 @@ def parse_args():
     ap.add_argument(
         "--max-pages",
         type=int,
-        default=2,
-        help="每个省份最多抓取分页数量（默认2，每页10条）。",
+        default=0,
+        help="每个省份最多扫描分页数量；默认0表示每批2页、每页10条，持续扫描直到找到可用源或列表结束。",
     )
     ap.add_argument(
         "--max-per-carrier",
         type=int,
         default=5,
-        help="每个运营商最多选取“新上线/存活”源数量（默认5）。",
-    )
-    ap.add_argument(
-        "--max-age-hours",
-        type=int,
-        default=72,
-        help="仅提取最近更新 N 小时内的源（默认72，约3天）。",
+        help="每个批次最多检查多少条存活联通源（默认5）。",
     )
     return ap.parse_args()
 
@@ -880,7 +870,6 @@ def main():
             args.test_region,
             max_pages=args.max_pages,
             max_per_carrier=args.max_per_carrier,
-            max_age_hours=args.max_age_hours,
         )
         total = (
             sum(len(lines) for sources in grouped_sources.values() for lines in sources)
@@ -913,7 +902,6 @@ def main():
             m3u_output_dir,
             max_pages=args.max_pages,
             max_per_carrier=args.max_per_carrier,
-            max_age_hours=args.max_age_hours,
         )
 
     generated_files = []

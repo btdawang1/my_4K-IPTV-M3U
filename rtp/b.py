@@ -35,7 +35,7 @@ GITHUB_COMMIT_PREFIX = "Auto update"
 EPG_URL = "http://epg.51zmt.top:8000/e.xml.gz"
 TVG_LOGO_BASE_URL = "https://gcore.jsdelivr.net/gh/taksssss/tv/icon/"
 README_FILE = "README.md"
-RAW_BASE_URL = "https://raw.githubusercontent.com/jia070310/4K-IPTV-M3U/main"
+RAW_BASE_URL = "https://raw.githubusercontent.com/btdawang1/my_4K-IPTV-M3U/main"
 PROXY_PREFIX = "https://gh-proxy.org/"
 
 # 中国省份全称及简称对照表，用于智能嗅探
@@ -88,6 +88,19 @@ def clear_output_files(txt_output_dir, m3u_output_dir):
                 except OSError:
                     pass
 
+
+def clear_province_output_files(province, txt_output_dir, m3u_output_dir):
+    """Remove old files for this province before writing the requested provider's results."""
+    for out_dir, suffix in ((txt_output_dir, ".txt"), (m3u_output_dir, ".m3u")):
+        if not os.path.exists(out_dir):
+            continue
+        for name in os.listdir(out_dir):
+            if name.startswith(province) and name.endswith(suffix):
+                try:
+                    os.remove(os.path.join(out_dir, name))
+                except OSError as e:
+                    print(f"[-] 无法清理旧文件 {name}: {e}")
+
 def _strip_html(raw):
     no_tags = re.sub(r"<[^>]+>", "", raw)
     return unescape(no_tags).replace("\xa0", " ").strip()
@@ -114,8 +127,8 @@ def generate_paer_token() -> str:
     return f"{ts}|{rand}|{sig}"
 
 
-REQUEST_DELAY_SEC = 5.0
-REQUEST_MAX_RETRIES = 2
+REQUEST_DELAY_SEC = 12.0
+REQUEST_MAX_RETRIES = 3
 RATE_LIMIT_BACKOFF_SEC = 60
 RATE_LIMIT_MAX_BACKOFF_SEC = 180
 RATE_LIMIT_COOLDOWN_SEC = 600
@@ -163,10 +176,11 @@ def signed_get(path_query: str, session: requests.Session | None = None) -> dict
             resp = sess.get(url, headers=headers, timeout=30)
             if resp.status_code == 429:
                 retry_after = _retry_after_seconds(resp)
-                wait = retry_after if retry_after is not None else min(
+                backoff = min(
                     RATE_LIMIT_MAX_BACKOFF_SEC,
                     RATE_LIMIT_BACKOFF_SEC * (2 ** attempt),
                 )
+                wait = max(retry_after or 0.0, backoff)
                 if attempt >= REQUEST_MAX_RETRIES:
                     cooldown = max(RATE_LIMIT_COOLDOWN_SEC, wait)
                     SITE_RATE_LIMITED_UNTIL = time.time() + cooldown
@@ -352,6 +366,7 @@ def fetch_channel_lines_by_s(s_token: str, session: requests.Session | None = No
                 continue
             seen.add(line)
             all_lines.append(line)
+        print(f"[*] 频道列表第{page_num}页 {len(page_lines)} 条，累计 {len(all_lines)} 条。")
         if "下一页" not in html and page_num > 1:
             break
     return all_lines
@@ -483,7 +498,7 @@ def fetch_channel_lines_by_province(
 
     selected_rows = []
     selected_tokens = set()
-    for carrier in ("电信", "移动", "联通"):
+    for carrier in ("联通",):
         for row in _pick_many(rows, carrier, max_per_carrier):
             token = row.get("p_token")
             if not token or token in selected_tokens:
@@ -491,24 +506,19 @@ def fetch_channel_lines_by_province(
             selected_rows.append(row)
             selected_tokens.add(token)
 
-    # 兜底：三网都没有可用源时，至少保留1条“新上线/存活”
     if not selected_rows:
-        for row in rows:
-            if _is_usable_status(row.get("status", "")) and _is_recent_update(row):
-                selected_rows = [row]
-                break
-
-    if not selected_rows:
-        return [], "no_recent_new_or_alive", province
+        return [], "no_recent_unicom_source", province
 
     # group_title -> list of sources, each source is list of "name,url" lines
     group_to_sources: dict[str, list[list[str]]] = {}
     selected_ops: list[str] = []
 
-    for picked in selected_rows:
+    print(f"[*] [{province}] 已选中 {len(selected_rows)} 条联通源，开始抓取详情和频道。")
+    for index, picked in enumerate(selected_rows, start=1):
         picked_type = picked.get("type", "")
         group_title = normalize_group_title(picked_type, province)
         selected_ops.append(group_title)
+        print(f"[*] [{province}] 联通源 {index}/{len(selected_rows)}：{picked.get('host', '未知服务器')}，抓取详情。")
         try:
             detail_html = fetch_detail_html(picked.get("p_token", ""), session=session)
         except SiteRateLimitError as e:
@@ -536,7 +546,7 @@ def fetch_channel_lines_by_province(
     unique_ops = sorted(set(selected_ops))
     print(
         f"[*] [{province}] 已提取源数量: {len(selected_rows)}"
-        f"（电信/移动/联通各最多{max_per_carrier}条，更新时间<= {max_age_hours}小时），来源: {', '.join(unique_ops)}"
+        f"（联通最多{max_per_carrier}条，更新时间<= {max_age_hours}小时），来源: {', '.join(unique_ops)}"
     )
     return group_to_sources, "ok", province
 
@@ -708,6 +718,7 @@ def process_province(
         max_per_carrier=max_per_carrier,
         max_age_hours=max_age_hours,
     )
+    clear_province_output_files(province, txt_output_dir, m3u_output_dir)
     if not grouped_sources:
         print(f"[-] [{province}] 频道提取失败: {status}")
         return
